@@ -1,4 +1,5 @@
 import pickle
+import os
 import pandas as pd
 import numpy as np
 from sklearn import neighbors
@@ -6,98 +7,171 @@ from sympy import li
 
 # Set the Data locations and names
 folder = "Data/"
+trained = folder+"Trained/"
 train = "RatingsTrain.parquet"
 test = "RatingsTest.parquet"
 
-# Read and fix parquet columns
-X_train = pd.read_parquet(folder+train)
-X_train.columns = X_train.columns.astype(int)
 
-X_test = pd.read_parquet(folder+test)
-X_test.columns = X_test.columns.astype(int)
+def main(clip=100):
+    # Read and fix parquet columns
+    X_train = pd.read_parquet(folder+train)
+    X_train.columns = X_train.columns.astype(int)
 
-# Read the pickle dictionaries
-with open(folder+"user2movie.json", "rb") as f:
-    user2movie = pickle.load(f)
+    X_test = pd.read_parquet(folder+test)
+    X_test.columns = X_test.columns.astype(int)
 
-with open(folder+"movie2user.json", "rb") as f:
-    movie2user = pickle.load(f)
+    # Read the pickle dictionaries
+    with open(folder+"user2movie.json", "rb") as f:
+        user2movie = pickle.load(f)
 
-# Determine if there are movies and users that are missing in the train
-X_test.columns.difference(X_train.columns)
-X_test.index.difference(X_train.index)
+    with open(folder+"movie2user.json", "rb") as f:
+        movie2user = pickle.load(f)
 
-# Set the parameters for prediction
-K_N = 25  # top k most similiar neighbours
-limit = 5  # number of movies in common to
-user_details = {}  # Will hold users neighbours, average value, etc
-for i in X_train.index:
+    # Determine if there are movies and users that are missing in the train
+    X_test.columns.difference(X_train.columns)
+    X_test.index.difference(X_train.index)
 
-    if i not in user_details.keys():
-        user_details[i] = {}
-        user_details[i]["Neighbours"] = pd.DataFrame(
-            {"NeighbourIndex": [], "NeighbourSimilarity": []})
-        # Get the mean and mean center the user
-        user_details[i]["avg"] = X_train.loc[i, :].mean()
-        X_train.loc[i, :] = X_train.loc[i, :] - user_details[i]["avg"]
+    # If there is a need to train
+    if "userdetails.json" in os.listdir(trained):
+        with open(trained+"userdetails.json", "rb") as f:
+            user_details = pickle.load(f)
+    else:
+        # For the time being its safe to clip the amount of users
+        X_train, user_details = UserBasedTrain(
+            X_train.head(clip), user2movie)
+        X_test = X_test.head(clip)
 
-    # Get the movies this user watched
-    movies_i = user2movie[i]
+    error = MeanSquaredError(user_details, user2movie, X_train, X_test)
+    print("User based Mean Squared Error is: ", error)
 
-    # Find the users neighbours
-    for j in X_train.index:
 
-        # Skip the same user or a user that is known neighbour
-        if j == i or j in user_details[i]["Neighbours"]["NeighbourIndex"]:
+def UserBasedTrain(X_train, user2movie, save=False):
+    # Set the parameters for prediction
+    tracking = 1
+    K_N = 25  # top k most similiar neighbours
+    limit = 5  # number of movies in common to
+    user_details = {}  # Will hold users neighbours, average value, etc
+    for i in X_train.index:
+
+        if i not in user_details.keys():
+            user_details[i] = {}
+            user_details[i]["Neighbours"] = pd.DataFrame(
+                {"NeighbourIndex": [], "NeighbourSimilarity": [], "AbsoluteSimilarity": []})
+            # Get the mean and mean center the user
+            user_details[i]["avg"] = X_train.loc[i, :].mean()
+            X_train.loc[i, :] = X_train.loc[i, :] - user_details[i]["avg"]
+
+        # Get the movies this user watched
+        movies_i = user2movie[i]
+
+        # Find the users neighbours
+        for j in X_train.index:
+
+            # Skip the same user or a user that is known neighbour
+            if j == i or j in user_details[i]["Neighbours"]["NeighbourIndex"].tolist():
+                continue
+
+            # Get the potential neighbours movie list
+            movies_j = user2movie[j]
+
+            # Extract the movies in common for both users
+            common_movies = (set(movies_i) & set(movies_j))
+
+            # If there are enough common movies to calculate similarity
+            if len(common_movies) > limit:
+
+                if j not in user_details.keys():
+                    user_details[j] = {}
+                    user_details[j]["Neighbours"] = pd.DataFrame(
+                        {"NeighbourIndex": [], "NeighbourSimilarity": [], "AbsoluteSimilarity": []})
+                    # Get the mean and mean center the user
+                    user_details[j]["avg"] = X_train.loc[j, :].mean()
+                    X_train.loc[j, :] = X_train.loc[j, :] - \
+                        user_details[j]["avg"]
+
+                # Calculate Similarity
+                numerator = np.dot(
+                    X_train.loc[i, common_movies], X_train.loc[j, common_movies])
+
+                denominator = np.linalg.norm(
+                    X_train.loc[i, common_movies]) * np.linalg.norm(X_train.loc[j, common_movies])
+
+                similarity = numerator/denominator
+
+                # Add Neighbours if there are less than top k
+                if len(user_details[i]["Neighbours"]) != K_N:
+
+                    user_details[i]["Neighbours"] = user_details[i]["Neighbours"].append(pd.DataFrame(
+                        {"NeighbourIndex": [j], "NeighbourSimilarity": [similarity], "AbsoluteSimilarity": [np.abs(similarity)]}), ignore_index=True).sort_values(by="AbsoluteSimilarity")
+
+                # If we have filled the quota of neighbours and if its more similar to our user
+                # compared to current least similar neighbour then we should replace the least similiar
+                elif np.abs(similarity) > user_details[i]["Neighbours"].iloc[0]["AbsoluteSimilarity"]:
+                    user_details[i]["Neighbours"] = user_details[i]["Neighbours"].append(pd.DataFrame(
+                        {"NeighbourIndex": [j], "NeighbourSimilarity": [similarity], "AbsoluteSimilarity": [np.abs(similarity)]}), ignore_index=True).sort_values(by="AbsoluteSimilarity").iloc[1:]
+
+                # Add Neighbours if there are less than top k
+                if len(user_details[j]["Neighbours"]) != K_N and i not in user_details[j]["Neighbours"]["NeighbourIndex"].tolist():
+
+                    user_details[j]["Neighbours"] = user_details[j]["Neighbours"].append(pd.DataFrame(
+                        {"NeighbourIndex": [i], "NeighbourSimilarity": [similarity], "AbsoluteSimilarity": [np.abs(similarity)]}), ignore_index=True).sort_values(by="AbsoluteSimilarity")
+
+                # If we have filled the quota of neighbours and if its more similar to seconday user
+                # compared to current least similar neighbour then we should replace the least similiar
+                elif np.abs(similarity) > user_details[j]["Neighbours"].iloc[0]["AbsoluteSimilarity"] and i not in user_details[j]["Neighbours"]["NeighbourIndex"].tolist():
+
+                    user_details[j]["Neighbours"] = user_details[j]["Neighbours"].append(pd.DataFrame(
+                        {"NeighbourIndex": [i], "NeighbourSimilarity": [similarity], "AbsoluteSimilarity": [np.abs(similarity)]}), ignore_index=True).sort_values(by="AbsoluteSimilarity").iloc[1:]
+
+        print(f"{tracking/len(X_train)} % is done")
+        tracking += 1
+    if save:
+        with open("Data/Trained/user_details.json", "wb") as f:
+            pickle.dump(user_details,  f)
+
+        X_train.columns = X_train.columns.astype(str)
+        X_train.to_parquet("Data/RatingsTrain.parquet")
+
+    return X_train, user_details
+
+
+def Predict(u, m, user_details, user2movie, X_train):
+    # Predicts the u th users m th movie rating
+    # Needs X_train and user_details completed
+    center_prediction = 0
+    denom = 0
+    for row in user_details[u]["Neighbours"].itertuples():
+        ni = getattr(row, "NeighbourIndex")
+        if m in user2movie[ni]:
+            sim = getattr(row,
+                          "NeighbourSimilarity")
+            rating = X_train.loc[ni, m]
+            center_prediction += sim * rating
+            denom += sim
+        else:
             continue
+    try:
+        pred = center_prediction/denom + user_details[u]["avg"]
+        pred = max(0.5, pred)
+        pred = min(5, pred)
+        return pred
+    except ZeroDivisionError:
+        return user_details[u]["avg"]
 
-        # Get the potential neighbours movie list
-        movies_j = user2movie[j]
 
-        # Extract the movies in common for both users
-        common_movies = (set(movies_i) & set(movies_j))
+def MeanSquaredError(user_details, user2movie, X_train, X_test):
+    error = 0
+    denom = 0
+    for i in X_test.index:
+        movies = X_test.columns[(~X_test.loc[i].isna())]
+        for m in movies:
+            denom += 1
+            pred = Predict(i, m,  user_details, user2movie, X_train)
+            actual = X_test.loc[i, m]
+            error += np.square(pred - actual)
 
-        # If there are enough common movies to calculate similarity
-        if len(common_movies) > limit:
+    return np.sqrt(error/denom)
 
-            if j not in user_details.keys():
-                user_details[j] = {}
-                user_details[j]["Neighbours"] = pd.DataFrame(
-                    {"NeighbourIndex": [], "NeighbourSimilarity": []})
-                # Get the mean and mean center the user
-                user_details[j]["avg"] = X_train.loc[j, :].mean()
-                X_train.loc[j, :] = X_train.loc[j, :] - user_details[j]["avg"]
 
-            # Calculate Similarity
-            numerator = np.dot(
-                X_train.loc[i, common_movies], X_train.loc[j, common_movies])
-
-            denominator = np.linalg.norm(
-                X_train.loc[i, common_movies]) * np.linalg.norm(X_train.loc[j, common_movies])
-
-            similarity = numerator/denominator
-
-            # Add Neighbours if there are less than top k
-            if len(user_details[i]["Neighbours"]) != 25:
-
-                user_details[i]["Neighbours"] = user_details[i]["Neighbours"].append(pd.DataFrame(
-                    {"NeighbourIndex": [j], "NeighbourSimilarity": [similarity]}), ignore_index=True).sort_values(by="NeighbourSimilarity")
-
-            # If we have filled the quota of neighbours and if its more similar to our user
-            # compared to current least similar neighbour then we should replace the least similiar
-            elif np.abs(similarity) > user_details[i]["Neighbours"].iloc[0]["NeighbourSimilarity"]:
-                user_details[i]["Neighbours"] = user_details[i]["Neighbours"].append(pd.DataFrame(
-                    {"NeighbourIndex": [j], "NeighbourSimilarity": [similarity]}), ignore_index=True).sort_values(by="NeighbourSimilarity").iloc[1:]
-
-            # Add Neighbours if there are less than top k
-            if len(user_details[j]["Neighbours"]) != 25:
-
-                user_details[j]["Neighbours"] = user_details[j]["Neighbours"].append(pd.DataFrame(
-                    {"NeighbourIndex": [i], "NeighbourSimilarity": [similarity]}), ignore_index=True).sort_values(by="NeighbourSimilarity")
-
-            # If we have filled the quota of neighbours and if its more similar to seconday user
-            # compared to current least similar neighbour then we should replace the least similiar
-            elif np.abs(similarity) > user_details[j]["Neighbours"].iloc[0]["NeighbourSimilarity"]:
-
-                user_details[j]["Neighbours"] = user_details[j]["Neighbours"].append(pd.DataFrame(
-                    {"NeighbourIndex": [i], "NeighbourSimilarity": [similarity]}), ignore_index=True).sort_values(by="NeighbourSimilarity").iloc[1:]
+if __name__ == '__main__':
+    main()
