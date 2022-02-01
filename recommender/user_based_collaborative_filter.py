@@ -4,7 +4,7 @@ import pickle
 
 
 def UserBasedTrain(X_train, user2movie, save=False):
-    # Set the parameters for prediction
+    # Set the parameters for training
     tracking = 1
     K_N = 25  # top k most similiar neighbours
     limit = 5  # number of movies in common to
